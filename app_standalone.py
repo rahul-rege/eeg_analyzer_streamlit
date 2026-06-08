@@ -11,14 +11,13 @@ its own and launched with:
 
     streamlit run app_standalone.py
 
-Two mutually-exclusive collapsible workflows are exposed on top of
-``render_combined_dashboard`` / ``render_paired_dashboard``:
-
-* **Person to Multiple Mudras** — one ``{person}_b4.eeg`` baseline +
-  several ``{person}_af_{mudra}.eeg`` after files for the same person.
-* **Multiple Persons Same Mudra** — N ``{person}_b4.eeg`` baselines + N
-  ``{person}_af_{mudra}.eeg`` after files (all the same mudra), paired
-  by person name.
+A single file uploader accepts every ``.eeg`` file at once. Each file
+follows the loose convention ``{Person}_{state}_{Mudra}.eeg`` where
+*state* is a before/after token (``b4``/``af`` and synonyms, any
+casing). Files are paired into Before-vs-After comparisons on
+``(person, mudra)`` and rendered with ``render_paired_dashboard``. A
+single supplied baseline is reused for any mudra that lacks its own
+before file.
 """
 
 from __future__ import annotations
@@ -30,9 +29,29 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import mne
 import numpy as np
+import pandas as pd
 import streamlit as st
 from matplotlib.figure import Figure
-from matplotlib.patches import Patch
+
+
+def _fmt_power(value: float) -> str:
+    """Readable plain-number label for a µV² band-power value.
+
+    Values land in roughly 0.1–1000 µV², so prefer ordinary decimals over
+    scientific notation (only the very tiny tail falls back to it).
+    """
+    if value is None or not np.isfinite(value):
+        return "—"
+    mag = abs(value)
+    if mag == 0:
+        return "0"
+    if mag >= 100:
+        return f"{value:,.0f}"
+    if mag >= 1:
+        return f"{value:.1f}"
+    if mag >= 0.01:
+        return f"{value:.2f}"
+    return f"{value:.1e}"
 
 
 # ======================================================================
@@ -204,74 +223,12 @@ def load_and_prepare_eeg(
     return select_channels(raw, selected_channels)
 
 
-def render_combined_dashboard(
-    raw_selected_data: dict,
-    freq_bands: dict = freq_bands,
-    suptitle: str = "",
-) -> Figure:
-    """Reproduce the notebook's combined PSD + band-power histogram figure."""
-    condition_names = [name for name, raw in raw_selected_data.items() if raw]
-    n_conditions = len(condition_names)
-    if n_conditions == 0:
-        raise ValueError("No valid recordings supplied to render the dashboard.")
-
-    cmap = plt.colormaps.get_cmap('viridis')
-    colors_list = [cmap(x) for x in np.linspace(0, 1, n_conditions)]
-    plot_colors = {name: colors_list[i] for i, name in enumerate(condition_names)}
-
-    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-
-    ax1 = axes[0]
-    for name in condition_names:
-        plot_psd(raw_selected_data[name], title_suffix=name,
-                 color=plot_colors[name], ax=ax1)
-    ax1.set_xlabel('Frequency (Hz)', fontsize=12)
-    ax1.set_ylabel('Power Spectral Density ($µV^2/Hz$)', fontsize=12)
-    ax1.set_title('Comparative Average Power Spectral Density', fontsize=14)
-    ax1.grid(True, linestyle='--', alpha=0.6)
-    ax1.set_xlim(0.5, 100)
-    ax1.set_yscale('log')
-    ax1.legend()
-
-    ax2 = axes[1]
-    all_band_powers = {
-        name: calculate_band_power(raw_selected_data[name], freq_bands)
-        for name in condition_names
-    }
-    band_names = list(freq_bands.keys())
-    n_bands = len(band_names)
-    bar_width = 0.8 / n_conditions
-    index = np.arange(n_bands)
-
-    for i, name in enumerate(condition_names):
-        values = [all_band_powers[name][b] for b in band_names]
-        ax2.bar(index + i * bar_width, values, bar_width, label=name,
-                color=plot_colors[name])
-
-    ax2.set_xlabel('Frequency Band', fontsize=12)
-    ax2.set_ylabel('Average Power ($µV^2$)', fontsize=12)
-    ax2.set_title('Comparative Average Power in EEG Frequency Bands', fontsize=14)
-    ax2.set_xticks(index + bar_width * (n_conditions - 1) / 2, band_names)
-    ax2.grid(axis='y', linestyle='--', alpha=0.6)
-    ax2.legend(title='Condition')
-
-    if suptitle:
-        fig.suptitle(suptitle, fontsize=16, fontweight='bold')
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
-    else:
-        fig.tight_layout()
-    return fig
-
-
 def render_paired_dashboard(
     paired_data,
     freq_bands: dict = freq_bands,
     suptitle: str = "",
 ) -> Figure:
-    """Render a Before-vs-After comparison for N persons sharing a mudra."""
-    BEFORE_COLOR = "#FF6347"
-    AFTER_COLOR = "#4682B4"
-
+    """Render a Before-vs-After comparison across one or more recordings."""
     pairs = [(p, b, a) for p, b, a in paired_data if b is not None and a is not None]
     if not pairs:
         raise ValueError("No valid person pairs supplied to render_paired_dashboard.")
@@ -313,51 +270,55 @@ def render_paired_dashboard(
     n_bands = len(band_names)
     band_x = np.arange(n_bands)
 
-    group_width = 0.85
-    cell_width = group_width / n_persons
-    bar_width = cell_width * 0.45
-
     powers_cache = {
-        p: (calculate_band_power(b, freq_bands),
-            calculate_band_power(a, freq_bands))
-        for p, b, a in pairs
+        label: (calculate_band_power(b, freq_bands),
+                calculate_band_power(a, freq_bands))
+        for label, b, a in pairs
     }
 
-    for i, (person, _, _) in enumerate(pairs):
-        cell_offset = (i - (n_persons - 1) / 2) * cell_width
-        before_x = band_x + cell_offset - bar_width / 2
-        after_x = band_x + cell_offset + bar_width / 2
+    # Each (recording, phase) is its own distinctly-coloured bar; bars are
+    # grouped under their frequency band (Delta / Theta / Alpha / ...).
+    single_pair = n_persons == 1
+    series: list[tuple[str, list]] = []
+    for label, _, _ in pairs:
+        before_vals = [powers_cache[label][0][b] for b in band_names]
+        after_vals = [powers_cache[label][1][b] for b in band_names]
+        before_name = "Before" if single_pair else f"{label} — Before"
+        after_name = "After" if single_pair else f"{label} — After"
+        series.append((before_name, before_vals))
+        series.append((after_name, after_vals))
 
-        before_vals = [powers_cache[person][0][b] for b in band_names]
-        after_vals = [powers_cache[person][1][b] for b in band_names]
+    n_series = len(series)
+    series_cmap = plt.colormaps.get_cmap('tab20' if n_series <= 20 else 'viridis')
 
-        ax2.bar(
-            before_x, before_vals, bar_width,
-            color=BEFORE_COLOR,
-            edgecolor=person_color[person], linewidth=1.4,
+    def _series_color(j: int):
+        if n_series <= 20:
+            return series_cmap(j % 20)
+        return series_cmap(j / max(n_series - 1, 1))
+
+    group_width = 0.85
+    bar_width = group_width / n_series
+
+    for j, (series_label, values) in enumerate(series):
+        offset = (j - (n_series - 1) / 2) * bar_width
+        bars = ax2.bar(
+            band_x + offset, values, bar_width,
+            label=series_label, color=_series_color(j),
         )
-        ax2.bar(
-            after_x, after_vals, bar_width,
-            color=AFTER_COLOR,
-            edgecolor=person_color[person], linewidth=1.4,
+        ax2.bar_label(
+            bars, labels=[_fmt_power(v) for v in values],
+            rotation=90, padding=2, fontsize=6,
         )
 
+    # Headroom so the rotated value labels above the tallest bars aren't clipped.
+    ax2.margins(y=0.18)
     ax2.set_xticks(band_x, band_names)
     ax2.set_xlabel('Frequency Band', fontsize=12)
     ax2.set_ylabel('Average Power ($µV^2$)', fontsize=12)
-    ax2.set_title('Per-Person Band Power: Before vs After', fontsize=14)
+    ax2.set_title('Band Power: Before vs After', fontsize=14)
     ax2.grid(axis='y', linestyle='--', alpha=0.6)
-
-    legend_handles = [
-        Patch(facecolor=BEFORE_COLOR, edgecolor='black', label='Before'),
-        Patch(facecolor=AFTER_COLOR, edgecolor='black', label='After'),
-    ]
-    legend_handles += [
-        Patch(facecolor='white', edgecolor=person_color[p], linewidth=1.6, label=p)
-        for p, _, _ in pairs
-    ]
-    ax2.legend(handles=legend_handles, fontsize=9, loc='upper right',
-               title='Phase / Person')
+    ax2.legend(fontsize=8, loc='upper right',
+               title='Phase' if single_pair else 'Recording / Phase')
 
     if suptitle:
         fig.suptitle(suptitle, fontsize=16, fontweight='bold')
@@ -410,43 +371,52 @@ def _load_one(uploaded_file, cfg: dict):
 
 
 # ----------------------------------------------------------------------
-# Filename parsing — convention:
-#   Before : {person}_b4.eeg               (e.g. Shreya_b4.eeg)
-#   After  : {person}_af_{mudra}.eeg       (e.g. Shreya_af_hakini.eeg)
-# Matching is case-insensitive; mudra/person can be multi-token.
+# Filename parsing — loose convention:
+#   {PersonName}_{state}_{MudraName}.eeg
+#
+# `state` flags the recording phase and is matched case-insensitively
+# against a small set of synonyms, so all of these are equivalent:
+#   Before : Rahul_b4_Prana.eeg, Rahul_B4_prana.eeg, raHul_b4_prana.eeg
+#   After  : Rahul_af_prana.eeg, Rahul_AF_prana.eeg
+# Person and mudra may each span multiple `_`-separated tokens. A
+# before/after pair is matched on (person, mudra), both lower-cased;
+# when a mudra has no matching before, a single supplied baseline is
+# reused as the comparison.
 # ----------------------------------------------------------------------
 
-def _parse_before_name(filename: str) -> str:
-    """Return the person name parsed from a `{person}_b4.eeg` style file."""
-    stem = Path(filename).stem
-    parts = stem.split("_")
-    kept = [p for p in parts if p.lower() != "b4"]
-    return ("_".join(kept) if kept else stem) or "Unknown"
+BEFORE_TOKENS = {"b4", "before", "pre", "baseline", "base"}
+AFTER_TOKENS = {"af", "after", "post"}
 
 
-def _parse_after_name(filename: str) -> tuple[str, str]:
-    """Return (person, mudra) from a `{person}_af_{mudra}.eeg` file."""
+def _parse_file_name(filename: str) -> tuple[str, str | None, str]:
+    """Parse `{person}_{state}_{mudra}.eeg` into (person, state, mudra).
+
+    `state` is ``"before"``, ``"after"``, or ``None`` when no recognised
+    phase token is present. Matching is case-insensitive.
+    """
     stem = Path(filename).stem
     parts = stem.split("_")
     lower = [p.lower() for p in parts]
-    if "af" in lower:
-        idx = lower.index("af")
-        person = "_".join(parts[:idx]) or "Unknown"
-        mudra = "_".join(parts[idx + 1:]) or "Unknown"
-        return person, mudra
-    if len(parts) >= 2:
-        return "_".join(parts[:-1]), parts[-1]
-    return stem, "Unknown"
 
+    state = None
+    state_idx = None
+    for i, tok in enumerate(lower):
+        if tok in BEFORE_TOKENS:
+            state, state_idx = "before", i
+            break
+        if tok in AFTER_TOKENS:
+            state, state_idx = "after", i
+            break
 
-def _unique_label(base: str, existing: dict) -> str:
-    """Disambiguate `base` against keys already in `existing` by appending (n)."""
-    if base not in existing:
-        return base
-    n = 2
-    while f"{base} ({n})" in existing:
-        n += 1
-    return f"{base} ({n})"
+    if state_idx is not None:
+        person = "_".join(parts[:state_idx]) or "Unknown"
+        mudra = "_".join(parts[state_idx + 1:]) or "Unknown"
+    else:
+        # No phase token found — best-effort: first token person, rest mudra.
+        person = parts[0] if parts else stem
+        mudra = "_".join(parts[1:]) if len(parts) > 1 else "Unknown"
+
+    return person, state, mudra
 
 
 # ----------------------------------------------------------------------
@@ -535,86 +505,112 @@ def _sidebar_config() -> dict:
 # Section builders
 # ----------------------------------------------------------------------
 
-def _build_section1_payload(
-    before_file,
-    after_files: list,
-    cfg: dict,
-) -> tuple[dict, str]:
-    """Section 1: one person, one baseline, multiple mudras."""
-    person = _parse_before_name(before_file.name)
-    raw_data: dict = {}
-    raw_data["Before"] = _load_one(before_file, cfg)
+def _build_payload(files: list, cfg: dict) -> tuple[list, str]:
+    """Pair uploaded After files against Before baselines.
 
-    skipped: list[str] = []
-    for af in after_files:
-        af_person, mudra = _parse_after_name(af.name)
-        if af_person.lower() != person.lower():
-            skipped.append(f"`{af.name}` (parsed person {af_person!r})")
+    Files are parsed with :func:`_parse_file_name`. Each After is matched
+    to a Before on the ``(person, mudra)`` key (case-insensitive). When a
+    mudra has no exact before, a baseline is reused as a fallback: the
+    person's single before if they have exactly one, otherwise the single
+    before supplied across all files. Unrecognised or unmatchable files
+    produce a Streamlit warning and are skipped.
+    """
+    befores: list[dict] = []
+    afters: list[dict] = []
+    unparsed: list[str] = []
+    for f in files:
+        person, state, mudra = _parse_file_name(f.name)
+        if state is None:
+            unparsed.append(f.name)
             continue
-        label = _unique_label(mudra.capitalize() or "Mudra", raw_data)
-        raw_data[label] = _load_one(af, cfg)
+        rec = {"person": person, "mudra": mudra, "file": f}
+        (befores if state == "before" else afters).append(rec)
 
-    if skipped:
+    if unparsed:
         st.warning(
-            f"Section 1 expects all files for the same person ({person!r}). "
-            f"Skipped: {', '.join(skipped)}"
+            "Could not find a before/after token (b4/af) in: "
+            + ", ".join(f"`{n}`" for n in unparsed)
+            + ". Expected `{Person}_{state}_{Mudra}.eeg`."
         )
 
-    suptitle = f"Person: {person} — Before vs Mudras"
-    return raw_data, suptitle
+    # Before lookups: exact (person, mudra), per-person, and global single.
+    before_by_pm: dict = {}
+    before_by_person: dict = {}
+    for b in befores:
+        before_by_pm.setdefault((b["person"].lower(), b["mudra"].lower()), b)
+        before_by_person.setdefault(b["person"].lower(), []).append(b)
+    global_before = befores[0] if len(befores) == 1 else None
 
+    # Cache loaded raws so a reused baseline is only processed once.
+    _loaded: dict = {}
 
-def _build_section2_payload(
-    before_files: list,
-    after_files: list,
-    cfg: dict,
-) -> tuple[list, str]:
-    """Section 2: multiple persons, one mudra, paired before/after per person."""
-    before_by_key: dict = {}
-    for bf in before_files:
-        person = _parse_before_name(bf.name)
-        before_by_key.setdefault(person.lower(), (person, bf))
+    def _load_rec(rec):
+        fid = id(rec["file"])
+        if fid not in _loaded:
+            _loaded[fid] = _load_one(rec["file"], cfg)
+        return _loaded[fid]
 
-    after_by_key: dict = {}
-    mudras_seen: list[str] = []
-    for af in after_files:
-        person, mudra = _parse_after_name(af.name)
-        after_by_key.setdefault(person.lower(), (person, af, mudra))
-        if mudra and mudra not in mudras_seen:
-            mudras_seen.append(mudra)
+    def _resolve_before(after_rec):
+        pk = (after_rec["person"].lower(), after_rec["mudra"].lower())
+        if pk in before_by_pm:
+            return before_by_pm[pk], False
+        person_befores = before_by_person.get(after_rec["person"].lower(), [])
+        if len(person_befores) == 1:
+            return person_befores[0], True
+        if global_before is not None:
+            return global_before, True
+        return None, False
 
-    if len(mudras_seen) > 1:
+    paired: list = []  # (person, mudra, before_rec, after_rec, is_fallback)
+    unmatched: list[str] = []
+    for a in afters:
+        before_rec, is_fallback = _resolve_before(a)
+        if before_rec is None:
+            unmatched.append(f"{a['person']}/{a['mudra']}")
+            continue
+        paired.append((a["person"], a["mudra"], before_rec, a, is_fallback))
+
+    if unmatched:
         st.warning(
-            "Section 2 expects all After files to share the same mudra, "
-            f"but found: {', '.join(mudras_seen)}. Using {mudras_seen[0]!r} for the title."
+            "No baseline available for: " + "; ".join(unmatched)
+            + ". Upload a matching before file, or a single before file to "
+            "reuse as the baseline."
         )
-    mudra_name = (mudras_seen[0] if mudras_seen else "Unknown").capitalize()
 
-    matched_keys = sorted(set(before_by_key) & set(after_by_key))
-    unmatched_before = sorted(set(before_by_key) - set(after_by_key))
-    unmatched_after = sorted(set(after_by_key) - set(before_by_key))
-    if unmatched_before or unmatched_after:
-        msg_parts = []
-        if unmatched_before:
-            msg_parts.append(
-                "before-only: " + ", ".join(before_by_key[k][0] for k in unmatched_before)
-            )
-        if unmatched_after:
-            msg_parts.append(
-                "after-only: " + ", ".join(after_by_key[k][0] for k in unmatched_after)
-            )
-        st.warning(
-            "Section 2 pairs files by person name; unpaired files were skipped "
-            "(" + "; ".join(msg_parts) + ")."
+    fallbacks = [f"{p}/{m}" for p, m, _, _, fb in paired if fb]
+    if fallbacks:
+        st.info(
+            "Reused a single baseline (no exact before file) for: "
+            + ", ".join(fallbacks)
         )
+
+    persons = {p for p, _, _, _, _ in paired}
+    mudras = {m for _, m, _, _, _ in paired}
+    multi_person = len(persons) > 1
+    multi_mudra = len(mudras) > 1
 
     paired_data: list = []
-    for key in matched_keys:
-        bf_name, bf_file = before_by_key[key]
-        _af_name, af_file, _mudra = after_by_key[key]
-        paired_data.append((bf_name, _load_one(bf_file, cfg), _load_one(af_file, cfg)))
+    for person, mudra, before_rec, after_rec, _ in paired:
+        if multi_person and multi_mudra:
+            label = f"{person} — {mudra}"
+        elif multi_mudra:
+            label = mudra.capitalize()
+        else:
+            label = person
+        paired_data.append((label, _load_rec(before_rec), _load_rec(after_rec)))
 
-    suptitle = f"Mudra: {mudra_name} — {len(paired_data)} person(s)"
+    if multi_person and multi_mudra:
+        suptitle = f"Before vs After — {len(paired_data)} recording(s)"
+    elif multi_mudra:
+        suptitle = f"{next(iter(persons))} — Before vs After across mudras"
+    elif multi_person:
+        suptitle = f"{next(iter(mudras)).capitalize()} — {len(paired_data)} person(s)"
+    elif paired_data:
+        person, mudra = paired[0][0], paired[0][1]
+        suptitle = f"{person} — {mudra.capitalize()}: Before vs After"
+    else:
+        suptitle = "Before vs After"
+
     return paired_data, suptitle
 
 
@@ -622,37 +618,31 @@ def _build_section2_payload(
 # Output
 # ----------------------------------------------------------------------
 
-def _show_section1_dashboard(raw_selected_data: dict, suptitle: str) -> None:
-    """Render Section 1's dashboard (one person, multiple mudras)."""
-    if len(raw_selected_data) < 2:
-        st.error("Need a Before plus at least one After to render a Section 1 dashboard.")
-        return
-
-    fig = v6.render_combined_dashboard(
-        raw_selected_data,
-        freq_bands=v6.freq_bands,
-        suptitle=suptitle,
-    )
-
-    st.subheader("Dashboard")
-    st.pyplot(fig, use_container_width=True)
-
-    summary_rows = []
-    for label, raw in raw_selected_data.items():
-        if raw is None:
-            continue
-        powers = v6.calculate_band_power(raw, v6.freq_bands)
-        summary_rows.append({"Condition": label, **powers})
-
-    st.subheader("Band-power summary (µV²)")
-    st.dataframe(summary_rows, use_container_width=True)
+def _build_band_power_table(paired_data: list) -> pd.DataFrame:
+    """Long-format before/after band-power table mirroring the bar chart."""
+    rows = []
+    for label, before_raw, after_raw in paired_data:
+        b_pow = v6.calculate_band_power(before_raw, v6.freq_bands)
+        a_pow = v6.calculate_band_power(after_raw, v6.freq_bands)
+        for band in v6.freq_bands:
+            before = b_pow.get(band, 0.0)
+            after = a_pow.get(band, 0.0)
+            change = ((after - before) / before * 100.0) if before else float("nan")
+            rows.append({
+                "Recording": label,
+                "Band": band,
+                "Before (µV²)": before,
+                "After (µV²)": after,
+                "Change %": change,
+            })
+    return pd.DataFrame(rows)
 
 
-def _show_section2_dashboard(paired_data: list, suptitle: str) -> None:
-    """Render Section 2's dashboard (multiple persons, paired before/after)."""
+def _show_dashboard(paired_data: list, suptitle: str) -> None:
+    """Render the before/after dashboard plus the comparison table."""
     valid_pairs = [(p, b, a) for p, b, a in paired_data if b is not None and a is not None]
     if not valid_pairs:
-        st.error("Need at least one fully-paired person (Before + After) to render.")
+        st.error("Need at least one fully-paired recording (Before + After) to render.")
         return
 
     fig = v6.render_paired_dashboard(
@@ -664,15 +654,14 @@ def _show_section2_dashboard(paired_data: list, suptitle: str) -> None:
     st.subheader("Dashboard")
     st.pyplot(fig, use_container_width=True)
 
-    summary_rows = []
-    for person, before_raw, after_raw in valid_pairs:
-        b_pow = v6.calculate_band_power(before_raw, v6.freq_bands)
-        a_pow = v6.calculate_band_power(after_raw, v6.freq_bands)
-        summary_rows.append({"Person": person, "Phase": "Before", **b_pow})
-        summary_rows.append({"Person": person, "Phase": "After", **a_pow})
-
-    st.subheader("Band-power summary (µV²)")
-    st.dataframe(summary_rows, use_container_width=True)
+    st.subheader("Band-power comparison (µV²)")
+    table = _build_band_power_table(valid_pairs)
+    styled = table.style.format({
+        "Before (µV²)": _fmt_power,
+        "After (µV²)": _fmt_power,
+        "Change %": lambda v: f"{v:+.1f}%" if np.isfinite(v) else "—",
+    })
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ----------------------------------------------------------------------
@@ -682,108 +671,28 @@ def _show_section2_dashboard(paired_data: list, suptitle: str) -> None:
 def main() -> None:
     st.title("🧠 EEG Before/After Dashboard")
     st.markdown(
-        "Pick **one** of the two workflows below, upload the matching "
-        "`.eeg` files, and click **Generate dashboard**."
+        "Upload all your `.eeg` files in the single box below and click "
+        "**Generate dashboard**. Before/After recordings are paired "
+        "automatically by person and mudra."
     )
     st.caption(
-        "Naming convention: Before files are `{person}_b4.eeg`; After files "
-        "are `{person}_af_{mudra}.eeg`. e.g. `Shreya_b4.eeg`, "
-        "`Shreya_af_hakini.eeg`."
+        "Naming convention: `{Person}_{state}_{Mudra}.eeg`, where *state* is "
+        "`b4`/`before` or `af`/`after` (any casing). e.g. `Rahul_b4_Prana.eeg` "
+        "and `Rahul_AF_prana.eeg` form one before/after pair. A single "
+        "before file is reused as the baseline for any mudra missing its own."
     )
 
     cfg = _sidebar_config()
 
-    with st.expander(
-        "Section 1 — Person to Multiple Mudras (1 Before + N After)",
-        expanded=True,
-    ):
-        st.caption(
-            "Single baseline for one person plus one After file per mudra. "
-            "All filenames should start with the same person name."
-        )
-        s1_before = st.file_uploader(
-            "Before file (`{person}_b4.eeg`)",
-            type=["eeg"],
-            key="s1_before",
-        )
-        s1_afters = st.file_uploader(
-            "After files (one per mudra, `{person}_af_{mudra}.eeg`)",
-            type=["eeg"],
-            accept_multiple_files=True,
-            key="s1_afters",
-        )
-        if s1_before or s1_afters:
-            before_person = _parse_before_name(s1_before.name) if s1_before else "—"
-            after_pairs = [_parse_after_name(f.name) for f in (s1_afters or [])]
-            after_summary = ", ".join(
-                f"{p}/{m}" for p, m in after_pairs
-            ) or "—"
-            st.markdown(
-                f"**Parsed** — Before person: `{before_person}` · "
-                f"After person/mudra: `{after_summary}`"
-            )
+    files = st.file_uploader(
+        "EEG files (`{Person}_{state}_{Mudra}.eeg`)",
+        type=["eeg"],
+        accept_multiple_files=True,
+        key="eeg_files",
+    )
 
-    with st.expander(
-        "Section 2 — Multiple Persons Same Mudra (N Before + N After)",
-        expanded=False,
-    ):
-        st.caption(
-            "Equal-size lists of Before/After files paired by person name "
-            "(case-insensitive). All After files must reference the same mudra."
-        )
-        s2_befores = st.file_uploader(
-            "Before files (one per person)",
-            type=["eeg"],
-            accept_multiple_files=True,
-            key="s2_befores",
-        )
-        s2_afters = st.file_uploader(
-            "After files (same mudra, one per person)",
-            type=["eeg"],
-            accept_multiple_files=True,
-            key="s2_afters",
-        )
-        if s2_befores or s2_afters:
-            before_persons = [_parse_before_name(f.name) for f in (s2_befores or [])]
-            after_pairs = [_parse_after_name(f.name) for f in (s2_afters or [])]
-            before_keys = {p.lower() for p in before_persons}
-            after_keys = {p.lower() for p, _ in after_pairs}
-            paired = sorted(before_keys & after_keys)
-            st.markdown(
-                f"**Parsed** — Before persons: `{', '.join(before_persons) or '—'}` · "
-                f"After person/mudra: "
-                f"`{', '.join(f'{p}/{m}' for p, m in after_pairs) or '—'}` · "
-                f"**Will pair {len(paired)} person(s)**: "
-                f"`{', '.join(paired) or '—'}`"
-            )
-
-    st.divider()
-
-    s1_files = bool(s1_before) or bool(s1_afters)
-    s2_files = bool(s2_befores) or bool(s2_afters)
-    s1_ready = bool(s1_before) and bool(s1_afters)
-    s2_ready = bool(s2_befores) and bool(s2_afters) and len(s2_befores) == len(s2_afters)
-
-    if s1_files and s2_files:
-        st.error(
-            "Files are present in both sections. Only one section can be used "
-            "at a time — clear the section you don't want."
-        )
-    elif not (s1_files or s2_files):
-        st.info("Upload files in one section to enable the dashboard.")
-    else:
-        if s1_files and not s1_ready:
-            st.warning(
-                "Section 1 needs a single Before file and at least one After file."
-            )
-        if s2_files and not s2_ready:
-            if not s2_befores or not s2_afters:
-                st.warning("Section 2 needs at least one Before and one After file.")
-            elif len(s2_befores) != len(s2_afters):
-                st.warning(
-                    f"Section 2 needs the same number of Before and After files "
-                    f"(got {len(s2_befores)} Before / {len(s2_afters)} After)."
-                )
+    if not files:
+        st.info("Upload one or more `.eeg` files to enable the dashboard.")
 
     has_channels = len(cfg["picked"]) > 0
     name_count_ok = len(cfg["ch_names"]) == cfg["num_channels"]
@@ -795,9 +704,10 @@ def main() -> None:
     if not name_count_ok:
         st.warning("Channel name count doesn't match the channel-in-file count.")
 
-    exactly_one_section = (s1_ready and not s2_files) or (s2_ready and not s1_files)
+    st.divider()
+
     can_run = (
-        exactly_one_section
+        bool(files)
         and has_channels
         and unique_names
         and name_count_ok
@@ -805,12 +715,8 @@ def main() -> None:
 
     if st.button("Generate dashboard", type="primary", disabled=not can_run):
         try:
-            if s1_ready:
-                raw_data, suptitle = _build_section1_payload(s1_before, s1_afters, cfg)
-                _show_section1_dashboard(raw_data, suptitle)
-            else:
-                paired_data, suptitle = _build_section2_payload(s2_befores, s2_afters, cfg)
-                _show_section2_dashboard(paired_data, suptitle)
+            paired_data, suptitle = _build_payload(files, cfg)
+            _show_dashboard(paired_data, suptitle)
         except Exception as exc:
             st.error(f"Failed to render dashboard: {exc}")
             st.exception(exc)
